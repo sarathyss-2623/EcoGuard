@@ -1,12 +1,5 @@
-/**
- * EcoGuard IoT Environmental Monitoring System
- * Web Serial API Manager
- *
- * STRICT REQUIREMENT:
- * Direct connection to physical ESP32 at 115200 baud via Web Serial API.
- * No intermediate synthetic data layer.
- * Developer simulation is strictly disabled by default.
- */
+/** Direct ESP32 Web Serial connection. The user selects the port in the browser picker. */
+const VALID_PROFILES = new Set(['GENERAL', 'OLDER_ADULT', 'PREGNANT', 'CHILD_UNDER_FIVE', 'ASTHMA']);
 
 export class SerialManager {
   constructor(parser, callbacks = {}) {
@@ -17,183 +10,181 @@ export class SerialManager {
       onError: callbacks.onError || (() => {}),
       onStatusChange: callbacks.onStatusChange || (() => {}),
     };
-
     this.port = null;
     this.reader = null;
+    this.readTask = null;
     this.keepReading = false;
     this.isConnected = false;
     this.isSimulated = false;
     this.hasReceivedFirstData = false;
     this.simInterval = null;
+    this.disconnectStatus = null;
+    this.finishPromise = null;
+    this.disconnectListener = null;
+    this.connecting = false;
+    this.writeQueue = Promise.resolve();
   }
 
   isSupported() {
-    return 'serial' in navigator;
+    return typeof navigator !== 'undefined' && 'serial' in navigator;
   }
 
-  /**
-   * Request user to pick the ESP32 USB serial port and open connection at 115200 baud
-   */
+  markReceiving() {
+    this.hasReceivedFirstData = true;
+    this.callbacks.onStatusChange('receiving');
+  }
+
+  setProfile(profile) {
+    if (!VALID_PROFILES.has(profile)) return Promise.reject(new Error('Unsupported ESP32 patient profile.'));
+    const operation = this.writeQueue.then(async () => {
+      if (!this.port || !this.isConnected || this.isSimulated) throw new Error('Connect to the ESP32 before changing its profile.');
+      if (!this.port.writable) throw new Error('The selected serial port does not support writing.');
+      const writer = this.port.writable.getWriter();
+      try {
+        await writer.write(new TextEncoder().encode(`${JSON.stringify({ command: 'set_profile', profile })}\n`));
+      } finally {
+        writer.releaseLock();
+      }
+      return true;
+    });
+    this.writeQueue = operation.catch(() => {});
+    return operation;
+  }
+
   async connect(baudRate = 115200) {
+    if (this.port || this.isConnected || this.isSimulated || this.connecting) return false;
     if (!this.isSupported()) {
-      const err = new Error('Web Serial API is not supported in this browser. Please use Google Chrome or Microsoft Edge.');
+      const err = new Error('Web Serial API is unavailable. Use Chrome or Edge over localhost/HTTPS.');
       this.callbacks.onError(err);
       this.callbacks.onStatusChange('error');
       throw err;
     }
 
+    this.connecting = true;
+    this.callbacks.onStatusChange('connecting');
     try {
-      this.callbacks.onStatusChange('connecting');
-      this.port = await navigator.serial.requestPort();
-      await this.port.open({ baudRate: parseInt(baudRate, 10) || 115200 });
-
+      const port = await navigator.serial.requestPort();
+      await port.open({ baudRate: Number(baudRate) || 115200 });
+      this.port = port;
+      this.keepReading = true;
       this.isConnected = true;
       this.isSimulated = false;
-      this.keepReading = true;
       this.hasReceivedFirstData = false;
-
-      // Status: Connected to port, waiting for real ESP32 frames
+      this.disconnectStatus = null;
+      this.finishPromise = null;
+      this.disconnectListener = event => {
+        if (event.port === this.port) {
+          this.disconnectStatus = 'connection-lost';
+          this.keepReading = false;
+          this.reader?.cancel().catch(() => {});
+        }
+      };
+      navigator.serial.addEventListener('disconnect', this.disconnectListener);
       this.callbacks.onStatusChange('connected-waiting');
-      this.callbacks.onConnect({
-        baudRate: 115200,
-        isSimulated: false,
-      });
-
-      this.readLoop();
+      this.callbacks.onConnect({ baudRate: Number(baudRate) || 115200, isSimulated: false, portInfo: port.getInfo?.() || {} });
+      this.readTask = this.readLoop();
       return true;
     } catch (err) {
-      this.isConnected = false;
-      this.isSimulated = false;
-
+      if (this.port) await this.finishDisconnect('disconnected');
       if (err.name === 'NotFoundError') {
-        // User cancelled port picker dialog
         this.callbacks.onStatusChange('disconnected');
         return false;
       }
-
-      let errorMsg = err.message || err.toString();
-      if (err.name === 'NetworkError' || errorMsg.includes('Failed to open')) {
-        errorMsg = 'Failed to open serial port. Please ensure Arduino IDE Serial Monitor is closed before connecting.';
-      }
-
-      const customError = new Error(errorMsg);
-      this.callbacks.onError(customError);
+      const message = err.name === 'NetworkError' ? 'Could not open the selected serial port. Close any serial monitor using it and retry.' : (err.message || String(err));
+      this.callbacks.onError(new Error(message));
       this.callbacks.onStatusChange('error');
-      throw customError;
+      throw new Error(message);
+    } finally {
+      this.connecting = false;
     }
   }
 
-  /**
-   * Continuous stream read loop
-   */
   async readLoop() {
-    const textDecoder = new TextDecoderStream();
-    this.port.readable.pipeTo(textDecoder.writable).catch(err => {
-      console.warn('Stream pipe warning:', err);
-    });
-    const reader = textDecoder.readable.getReader();
-    this.reader = reader;
-
+    const port = this.port;
+    const decoder = new TextDecoder();
     try {
+      const reader = port.readable.getReader();
+      this.reader = reader;
       while (this.keepReading) {
         const { value, done } = await reader.read();
         if (done) {
+          if (this.keepReading) this.disconnectStatus = 'connection-lost';
           break;
         }
-        if (value) {
-          if (!this.hasReceivedFirstData) {
-            this.hasReceivedFirstData = true;
-            this.callbacks.onStatusChange('connected');
-          }
-          this.parser.feed(value);
-        }
+        if (value) this.parser.feed(decoder.decode(value, { stream: true }));
       }
+      const tail = decoder.decode();
+      if (tail) this.parser.feed(tail);
     } catch (error) {
-      console.warn('Serial stream read error:', error);
-      this.callbacks.onError(error);
-      this.callbacks.onStatusChange('error');
+      if (this.keepReading) {
+        this.callbacks.onError(error);
+        this.disconnectStatus = 'connection-lost';
+      }
     } finally {
-      try {
-        reader.releaseLock();
-      } catch (e) {}
-      await this.disconnect();
+      try { this.reader?.releaseLock(); } catch {}
+      this.reader = null;
+      await this.finishDisconnect(this.disconnectStatus || 'connection-lost');
     }
+  }
+
+  async finishDisconnect(status) {
+    if (this.finishPromise) return this.finishPromise;
+    this.keepReading = false;
+    this.finishPromise = (async () => {
+      const port = this.port;
+      if (this.disconnectListener && typeof navigator !== 'undefined' && navigator.serial) {
+        navigator.serial.removeEventListener('disconnect', this.disconnectListener);
+      }
+      this.disconnectListener = null;
+      if (port) {
+        await this.writeQueue;
+        try { await port.close(); } catch (error) { console.warn('Serial port close:', error); }
+      }
+      this.port = null;
+      this.isConnected = false;
+      this.isSimulated = false;
+      this.hasReceivedFirstData = false;
+      this.readTask = null;
+      this.callbacks.onDisconnect(status);
+      this.callbacks.onStatusChange(status);
+      this.parser.reset();
+    })();
+    return this.finishPromise;
   }
 
   async disconnect() {
+    if (this.isSimulated) {
+      this.stopSimulation();
+      this.isConnected = false;
+      this.callbacks.onDisconnect('disconnected');
+      this.callbacks.onStatusChange('disconnected');
+      this.parser.reset();
+      return;
+    }
+    if (!this.port) return;
+    this.disconnectStatus = 'disconnected';
     this.keepReading = false;
-    this.stopSimulation();
-
-    if (this.reader) {
-      try {
-        await this.reader.cancel();
-      } catch (e) {}
-      this.reader = null;
-    }
-
-    if (this.port) {
-      try {
-        await this.port.close();
-      } catch (e) {}
-      this.port = null;
-    }
-
-    this.isConnected = false;
-    this.isSimulated = false;
-    this.hasReceivedFirstData = false;
-    this.callbacks.onDisconnect();
-    this.callbacks.onStatusChange('disconnected');
-    this.parser.reset();
+    try { await this.reader?.cancel(); } catch {}
+    if (this.readTask) await this.readTask;
+    else await this.finishDisconnect('disconnected');
   }
 
-  /**
-   * DEVELOPER SIMULATION MODE (OFFLINE TESTING ONLY)
-   * Must NEVER be enabled by default.
-   */
-  startSimulation(baudRate = 115200) {
-    if (this.isConnected) {
-      this.disconnect();
-    }
-
+  async startSimulation(baudRate = 115200) {
+    if (this.isSimulated) return;
+    if (this.port) await this.disconnect();
     this.isSimulated = true;
     this.isConnected = true;
     this.hasReceivedFirstData = true;
-    this.callbacks.onStatusChange('connected');
-    this.callbacks.onConnect({
-      baudRate: baudRate,
-      isSimulated: true,
-    });
-
-    let cycle = 0;
+    this.callbacks.onStatusChange('connected-waiting');
+    this.callbacks.onConnect({ baudRate, isSimulated: true });
     this.simInterval = setInterval(() => {
-      cycle++;
-      let output = '================================\n';
-      output += '   SENSOR COMBINED TEST\n';
-      output += '================================\n\n';
-
-      output += '--- DHT22 ---\n';
-      output += 'Temperature: 34.20 C\n';
-      output += 'Humidity: 73.10 %\n\n';
-
-      output += '--- MQ-135 ---\n';
-      output += 'Gas Analog Value: 592\n\n';
-
-      output += '--- GPS ---\n';
-      output += 'GPS: NO FIX\n';
-      output += 'Satellites: 0\n\n';
-
-      output += 'BUZZER: ON - HIGH TEMPERATURE\n\n';
-      output += '================================\n';
-
-      this.parser.feed(output);
+      this.parser.feed('================================\n   SENSOR COMBINED TEST\n================================\n--- DHT22 ---\nTemperature: 34.20 C\nHumidity: 73.10 %\n--- MQ-135 ---\nGas Analog Value: 592\n--- GPS ---\nGPS: NO FIX\nSatellites: 0\nBUZZER: ON - HIGH TEMPERATURE\n================================\n');
     }, 2000);
   }
 
   stopSimulation() {
-    if (this.simInterval) {
-      clearInterval(this.simInterval);
-      this.simInterval = null;
-    }
+    if (this.simInterval) clearInterval(this.simInterval);
+    this.simInterval = null;
     this.isSimulated = false;
   }
 }

@@ -68,7 +68,9 @@ export class ReportsEngine {
         'Longitude',
         'Satellites',
         'Hardware_Buzzer_State',
-        'Alert_State'
+        'Alert_State',
+        'Heat_Index_C',
+        'Heat_Risk_Level'
       ];
       rows = records.map(r => [
         r.timestamp,
@@ -81,7 +83,9 @@ export class ReportsEngine {
         r.longitude !== null ? r.longitude.toFixed(6) : 'NO_FIX',
         r.satellites !== null ? r.satellites : 0,
         r.buzzerState || 'OFF',
-        r.alertActive ? 'ACTIVE' : 'INACTIVE'
+        r.alertActive ? 'ACTIVE' : 'INACTIVE',
+        r.heatIndexC !== null && r.heatIndexC !== undefined ? r.heatIndexC.toFixed(1) : 'UNAVAILABLE',
+        r.heatRiskLevel || 'UNAVAILABLE'
       ]);
     }
 

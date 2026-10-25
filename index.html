@@ -280,12 +280,13 @@
                 <span id="stat-last-update" class="font-body-md text-body-md font-semibold text-primary mt-0.5">--:--:--</span>
               </div>
               <div class="flex flex-col p-space-sm bg-outline-variant/10 border border-outline-variant/30 rounded">
-                <span class="font-label-sm text-label-sm uppercase tracking-wider text-secondary">High Temp Setpoint</span>
-                <span class="font-body-md text-body-md font-bold text-primary mt-0.5 tabular-nums">34.0 °C</span>
+                <span class="font-label-sm text-label-sm uppercase tracking-wider text-secondary">Patient Threshold</span>
+                <span id="dash-patient-threshold" class="font-body-md text-body-md font-bold text-primary mt-0.5 tabular-nums">--</span>
               </div>
               <div class="flex flex-col p-space-sm bg-outline-variant/20 border border-primary/40 rounded">
                 <span class="font-label-sm text-label-sm uppercase tracking-wider text-primary font-semibold">Ambient Status</span>
                 <span id="stat-ambient-status" class="font-body-md text-body-md font-bold text-primary mt-0.5">Waiting for data...</span>
+                <span id="dash-firmware-details" class="font-label-sm text-label-sm text-secondary mt-0.5">Waiting for ESP32 risk and profile data</span>
               </div>
             </div>
           </section>
@@ -322,7 +323,7 @@
                 </div>
                 <div class="flex flex-col border-r border-brand-rock pr-space-sm">
                   <span class="font-label-sm text-label-sm uppercase text-secondary">Threshold</span>
-                  <span class="font-body-lg text-body-lg text-primary tabular-nums">34.0 °C</span>
+                  <span class="font-body-lg text-body-lg text-primary tabular-nums">--</span>
                 </div>
                 <div class="flex flex-col border-r border-brand-rock pr-space-sm">
                   <span class="font-label-sm text-label-sm uppercase text-secondary">Buzzer</span>
@@ -379,11 +380,12 @@
                     </div>
                   </div>
                   <div class="text-right">
-                    <span class="font-label-sm text-label-sm uppercase text-secondary block">Normal Range</span>
-                    <span class="font-body-sm text-body-sm font-semibold text-primary">20.0 °C – 34.0 °C</span>
+                    <span class="font-label-sm text-label-sm uppercase text-secondary block">ESP32 Configured Thresholds</span>
+                    <span id="dash-temp-thresholds" class="font-body-sm text-body-sm font-semibold text-primary">Waiting for device thresholds</span>
                     <div id="dash-trend-temp" class="font-label-sm text-label-sm text-primary font-semibold mt-1 bg-brand-rock/20 px-1.5 py-0.5 rounded border border-brand-rock/40">
                       Awaiting Telemetry
                     </div>
+                    <div id="dash-heat-index" class="font-label-sm text-label-sm text-secondary mt-1">Heat index (ESP32): --</div>
                   </div>
                 </div>
 
@@ -391,7 +393,7 @@
                 <div class="mt-space-md p-space-xs bg-brand-rock/10 border border-brand-rock/30 rounded">
                   <div class="flex justify-between items-center text-secondary font-label-sm text-label-sm mb-1 px-1">
                     <span>T-BUFFER</span>
-                    <span>SETPOINT: 34.0°C</span>
+                    <span id="sparkline-temp-threshold">SETPOINT: --</span>
                     <span>LATEST</span>
                   </div>
                   <svg id="sparkline-temp" class="w-full h-16" fill="none" preserveAspectRatio="none" viewBox="0 0 280 64"></svg>
@@ -425,8 +427,8 @@
                     </div>
                   </div>
                   <div class="text-right">
-                    <span class="font-label-sm text-label-sm uppercase text-secondary block">Reference Range</span>
-                    <span class="font-body-sm text-body-sm font-semibold text-primary">40.0 % – 80.0 %</span>
+                    <span class="font-label-sm text-label-sm uppercase text-secondary block">ESP32 Configured Thresholds</span>
+                    <span id="dash-hum-thresholds" class="font-body-sm text-body-sm font-semibold text-primary">Waiting for device thresholds</span>
                     <div id="dash-trend-hum" class="font-label-sm text-label-sm text-primary font-medium mt-1 bg-brand-rock/10 px-1.5 py-0.5 rounded border border-brand-rock/40">
                       Awaiting Telemetry
                     </div>
@@ -673,7 +675,7 @@
                       </div>
                       <div class="flex items-center justify-between">
                         <span class="font-label-sm text-label-sm uppercase text-secondary">Trigger Logic</span>
-                        <span class="font-body-sm text-body-sm font-semibold text-primary">DHT22 Temp &gt; 34.0 °C (ESP32 Firmware-Controlled)</span>
+                        <span class="font-body-sm text-body-sm font-semibold text-primary">ESP32 firmware-reported risk and buzzer state</span>
                       </div>
                       <div class="flex items-center justify-between">
                         <span class="font-label-sm text-label-sm uppercase text-secondary">Source of Truth</span>
@@ -777,7 +779,7 @@
             <!-- Diagnostic Footnote -->
             <div class="mt-space-sm pt-space-xs border-t border-brand-rock/30 flex flex-col sm:flex-row items-start sm:items-center justify-between text-secondary font-label-sm text-label-sm">
               <span id="footer-uart-info">UART Channel: Web Serial • Baud Rate: 115200 • Data: 8N1</span>
-              <span>Firmware Buzzer Trigger: Temp &gt; 34.0 °C • Pin: GPIO 25</span>
+              <span>Active-profile temperature threshold: <span id="dash-buzzer-threshold">--</span> | Buzzer status from ESP32 | Pin: GPIO 25</span>
             </div>
           </section>
 
@@ -954,7 +956,7 @@
                   <p><strong class="text-primary">Parameters:</strong> Ambient Temperature (°C) &amp; Relative Humidity (%)</p>
                   <p><strong class="text-primary">Range:</strong> -40 to 80 °C (±0.5°C) • 0 to 100% RH (±2% RH)</p>
                   <p><strong class="text-primary">Sampling Period:</strong> 2.0 Seconds (500mHz)</p>
-                  <p><strong class="text-primary">Firmware Setpoint:</strong> Buzzer trigger at &gt; 34.0 °C</p>
+                  <p><strong class="text-primary">Active profile threshold reported by ESP32:</strong> <span id="sensor-patient-threshold">--</span>. Physical buzzer activation is controlled by device firmware.</p>
                 </div>
               </div>
               <button class="mt-space-md border border-primary text-primary hover:bg-primary hover:text-surface py-1 rounded font-label-md text-label-md uppercase tracking-wider transition-all open-modal-btn" data-sensor="temperature">
@@ -1009,7 +1011,7 @@
                 </div>
                 <div class="mt-space-sm space-y-1 text-secondary font-body-sm text-body-sm">
                   <p><strong class="text-primary">ESP32 Pin:</strong> GPIO 25 (Digital Output)</p>
-                  <p><strong class="text-primary">Trigger Logic:</strong> <code class="text-primary bg-brand-rock/20 px-1">if (temperature &gt; 34) digitalWrite(25, HIGH);</code></p>
+                  <p><strong class="text-primary">Trigger Logic:</strong> Determined by device firmware; this dashboard reads the reported buzzer state and does not send buzzer commands.</p>
                   <p><strong class="text-primary">Web Integration:</strong> Alerts trigger strictly on <code class="text-primary bg-brand-rock/20 px-1">BUZZER: ON - HIGH TEMPERATURE</code></p>
                   <p><strong class="text-primary">Clear Logic:</strong> Dismisses strictly on <code class="text-primary bg-brand-rock/20 px-1">BUZZER: OFF</code></p>
                 </div>
@@ -1083,8 +1085,8 @@
                     <span class="font-bold text-primary">ESP32 Node 01</span>
                   </div>
                   <div class="flex items-center justify-between">
-                    <span>ESP32 Hardware Threshold:</span>
-                    <span class="font-bold text-primary tabular-nums">34.0 °C (Hardcoded in Firmware)</span>
+                    <span>Active Profile Temperature Threshold:</span>
+                    <span id="settings-patient-threshold" class="font-bold text-primary tabular-nums">Waiting for ESP32 profile</span>
                   </div>
                 </div>
               </div>
@@ -1133,6 +1135,12 @@
               </div>
             </div>
           </div>
+
+          <section class="bg-surface border border-brand-rock rounded p-space-md">
+            <span class="font-headline-sm text-headline-sm text-primary uppercase font-bold">Additional Heat Precautions</span>
+            <p class="font-body-sm text-body-sm text-secondary mt-1">Checking a profile requests it from the ESP32; confirmation appears only after a successful device response. Checked profiles remain local precaution preferences. <span id="profile-command-status">ESP32 profile has not been changed.</span></p>
+            <div id="risk-profile-options" class="mt-space-sm grid grid-cols-1 sm:grid-cols-2 gap-space-xs"></div>
+          </section>
 
           <!-- Raw Serial Terminal Monitor -->
           <section class="bg-surface border border-brand-rock rounded p-space-md shadow-sm">

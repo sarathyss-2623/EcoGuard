@@ -10,10 +10,10 @@ The application displays **strictly real sensor telemetry** parsed from the phys
 
 | Sensor / Actuator | Parameter | ESP32 Pin | Interface / Protocol | Firmware Logic / Notes |
 |---|---|---|---|---|
-| **DHT22** | Temperature & Humidity | **GPIO 4** | 1-Wire Digital (`DHT.h`) | Sampling: ~2.0s • Threshold: > 34.0 °C |
+| **DHT22** | Temperature & Humidity | **GPIO 4** | 1-Wire Digital (`DHT.h`) | Sampling: ~2.0s; active profile threshold is reported by ESP32 telemetry |
 | **MQ-135** | Air Quality Transducer | **GPIO 34** | ADC1_CH6 (Analog Input) | Raw 10-bit ADC Voltage (0–4095) • Unscaled |
 | **NEO-6M GPS** | Geolocation & Constellation | **GPIO 26 (RX), 27 (TX)** | HardwareSerial `GPS(1)` | 9600 Baud • NMEA sentences (`TinyGPS++`) |
-| **Piezo Buzzer** | Acoustic Hardware Alarm | **GPIO 25** | Digital Output | Active HIGH • Triggered when Temp > 34.0 °C |
+| **Piezo Buzzer** | Acoustic Hardware Alarm | **GPIO 25** | Digital Output | Active HIGH; activation rule is controlled by ESP32 firmware |
 | **PMS5003** | Particulate Matter (PM2.5) | Reserved | UART Laser Scattering | Reserved for future firmware revision |
 
 **Default Serial Baud Rate:** `115200` (8N1)
@@ -31,21 +31,18 @@ PHYSICAL ESP32 (Firmware Output)
              ↓
       Line Buffer Stream
              ↓
-        ASCII Parser
+        Newline JSON / Legacy Parser
              ↓
       Telemetry State
              ↓
      Dashboard UI & Charts
 ```
 
-- **Exact Protocol Match**: Directly parses output lines emitted by the ESP32 firmware:
-  - `Temperature: <value> C`
-  - `Humidity: <value> %`
-  - `Gas Analog Value: <value>`
-  - `GPS: NO FIX` or `Latitude: <value>`, `Longitude: <value>`, `Satellites: <value>`
-  - `BUZZER: ON - HIGH TEMPERATURE` & `BUZZER: OFF`
-  - `DHT22: ERROR`
-- **Firmware-Driven Alerts**: Web alerts are triggered **exclusively** when the ESP32 emits `BUZZER: ON - HIGH TEMPERATURE` and cleared upon receiving `BUZZER: OFF`. Temperature readings alone never generate invented alerts.
+- **Serial Protocols**: Reads newline-delimited ESP32 JSON snapshots and retains compatibility with the earlier plain-text firmware output.
+- **Firmware Risk**: In JSON mode, risk level, reason, patient profile, thresholds, and buzzer state come from the ESP32. Local heat assessment remains limited to the legacy text stream.
+- **Human Calculation**: The dashboard displays the ESP32-reported calculation profile, measurement, thresholds, difference, validity, and crossing status, and lists the reported threshold for each available profile. Invalid DHT data makes calculated values unavailable.
+- **Profile Commands**: Checking one of the existing profile preferences requests `{"command":"set_profile","profile":"..."}` over the open serial port. The UI only updates confirmed device profile values after a successful `command_result`; failed, incomplete, or disconnected requests leave the prior confirmation unchanged.
+- **Buzzer State**: The dashboard reports `buzzer_on` from the latest valid ESP32 message. If telemetry becomes stale or disconnects, it labels the last ON/OFF value as stale. The app does not command the physical buzzer. No Arduino firmware source is included here, so the device-side activation rule cannot be verified or changed in this repository; `patient_temperature_threshold` is shown as reported configuration, not treated as a web-app override.
 - **Raw MQ-135 Readings**: Raw ADC values are preserved directly without uncalibrated conversions to PPM or AQI.
 
 ---
@@ -96,10 +93,13 @@ http://localhost:3000
 > [!IMPORTANT]
 > **Close the Arduino IDE Serial Monitor before connecting.** The Arduino IDE and the browser cannot share the COM port at the same time.
 
-1. Click **Connect ESP32** in the top navigation bar.
-2. Select your ESP32 COM port in the browser prompt.
-3. The dashboard will show `CONNECTED — WAITING FOR DATA` and transition to `ESP32 CONNECTED` as soon as real telemetry frames arrive.
-4. Watch real-time lines appear in the **Live Raw Serial Monitor** and watch the sensor cards update.
+1. Open the app from `http://localhost:3000` in Chrome or Edge.
+2. Click **Connect ESP32** and select **COM10** from the browser's serial picker.
+3. The app opens the selected port at **115200 baud**. The browser requires the click to grant serial access; close Arduino Serial Monitor first.
+4. The dashboard waits for a newline-delimited JSON message and updates when a valid message arrives.
+5. Watch real-time lines appear in the **Live Raw Serial Monitor** and watch the sensor cards update.
+
+Web Serial does not expose the Windows COM name after selection, so the app reports the selected USB serial connection and baud rate rather than claiming COM10 based on unavailable port metadata.
 
 ---
 

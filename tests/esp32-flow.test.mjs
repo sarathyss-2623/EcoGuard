@@ -1,0 +1,56 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { ESP32Parser } from '../js/parser.js';
+
+test('valid ESP32 JSON reaches live state and uses firmware risk, profile, and buzzer fields', async () => {
+  globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+  const { state, recordReading, expireStaleTelemetry, applyProfileCommandResult, clearConfirmedDeviceProfile } = await import('../js/state.js');
+  const readings = [];
+  const parser = new ESP32Parser(reading => { readings.push(reading); recordReading(reading); });
+  const payload = { message_type: 'telemetry', temperature: 31.2, humidity: 84.9, heat_index: 43.42179, dht_valid: true, mq135_raw: 768, gps_fix: false, latitude: 0, longitude: 0, satellites: 0, patient_profile: 'OLDER_ADULT', patient_temperature_threshold: 32, human_calculation: { profile: 'OLDER_ADULT', temperature_threshold: 32, temperature_valid: true, threshold_crossed: false, measured_temperature: 31.2, temperature_difference: -0.8, temperature_unit: 'C' }, risk_level: 'CRITICAL', risk_reason: 'Extreme heat', buzzer_on: true, buzzer_trigger: 'PROFILE_THRESHOLD', thresholds: { temperature_caution: 30, temperature_high: 35, temperature_extreme: 40, humidity_low: 30, humidity_high: 70, humidity_extreme: 85, heat_index_caution: 27, heat_index_high: 32, heat_index_extreme: 39 }, patient_profiles: [{ name: 'GENERAL', temperature_threshold: 34, active: false }, { name: 'OLDER_ADULT', temperature_threshold: 32, active: true }, { name: 'PREGNANT', temperature_threshold: 32, active: false }, { name: 'CHILD_UNDER_FIVE', temperature_threshold: 32, active: false }, { name: 'ASTHMA', temperature_threshold: 34, active: false }] };
+  const line = `${JSON.stringify(payload)}\n`;
+  parser.feed(line.slice(0, 83));
+  parser.feed(line.slice(83));
+  assert.equal(readings.length, 1);
+  assert.equal(state.current.temperature, 31.2);
+  assert.equal(state.current.heatIndex, 43.42179);
+  assert.equal(state.current.gasAnalog, 768);
+  assert.equal(state.current.gps.hasFix, false);
+  assert.equal(state.current.gps.latitude, null);
+  assert.equal(state.current.patientProfile, 'OLDER_ADULT');
+  assert.equal(state.current.patientTemperatureThreshold, 32);
+  assert.deepEqual(state.current.humanCalculation, { profile: 'OLDER_ADULT', temperatureThreshold: 32, temperatureValid: true, thresholdCrossed: false, measuredTemperature: 31.2, temperatureDifference: -0.8, temperatureUnit: 'C' });
+  assert.equal(state.current.patientProfiles.length, 5);
+  assert.equal(state.current.riskLevel, 'CRITICAL');
+  assert.equal(state.current.buzzer.state, 'ACTIVE');
+  assert.equal(state.heatAssessment, null);
+  const alert = state.alertsHistory.find(item => item.ruleId === 'esp32-risk-v1');
+  assert.equal(alert.riskReason, 'Extreme heat');
+  assert.equal(applyProfileCommandResult({ success: false, message: 'Rejected', patientProfile: 'GENERAL', patientTemperatureThreshold: 34 }), false);
+  assert.equal(state.current.patientProfile, 'OLDER_ADULT');
+  assert.equal(applyProfileCommandResult({ success: true, message: 'Profile changed', patientProfile: 'ASTHMA', patientTemperatureThreshold: 34 }), true);
+  assert.equal(state.current.patientProfile, 'ASTHMA');
+  assert.equal(state.current.patientTemperatureThreshold, 34);
+  assert.equal(state.current.humanCalculation.thresholdCrossed, null);
+  for (const temperature of [33.9, 34, 34.1]) {
+    parser.feed(`${JSON.stringify({ ...payload, temperature, risk_level: 'CRITICAL', buzzer_on: false })}\n`);
+    assert.equal(state.current.buzzer.state, 'OFF', `buzzer state must follow the ESP32 flag at ${temperature}°C`);
+    assert.equal(state.activeAlert.buzzerOn, false);
+  }
+  const alertCountBeforeInvalidReading = state.alertsHistory.length;
+  parser.feed(`${JSON.stringify({ ...payload, temperature: null, humidity: null, heat_index: null, dht_valid: false, mq135_raw: null, gps_fix: false, risk_level: 'UNKNOWN', buzzer_on: false })}\n`);
+  assert.equal(state.current.temperature, null);
+  assert.equal(state.current.gasAnalog, null);
+  assert.equal(state.alertsHistory.length, alertCountBeforeInvalidReading);
+  assert.equal(alert.status, 'active');
+  assert.equal(alert.buzzerOn, false);
+  parser.feed(`${JSON.stringify({ ...payload, risk_level: 'NORMAL', buzzer_on: false })}\n`);
+  assert.equal(alert.status, 'resolved');
+  expireStaleTelemetry(Date.now() + 11_000);
+  assert.equal(state.connection.status, 'stale');
+  assert.equal(state.current.patientProfile, 'UNKNOWN');
+  assert.equal(state.current.patientTemperatureThreshold, null);
+  clearConfirmedDeviceProfile('disconnected');
+  assert.equal(state.current.patientProfile, 'UNKNOWN');
+  assert.equal(state.current.patientProfiles.length, 0);
+});

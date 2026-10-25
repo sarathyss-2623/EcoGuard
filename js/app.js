@@ -16,11 +16,17 @@ import {
   getFilteredHistory,
   calculateStats,
   clearHistory,
+  saveState,
+  expireStaleAssessment,
+  expireStaleTelemetry,
+  applyProfileCommandResult,
+  clearConfirmedDeviceProfile,
 } from './state.js';
 import { ESP32Parser } from './parser.js';
 import { SerialManager } from './serial.js';
 import { TelemetryCharts } from './charts.js';
 import { ReportsEngine } from './reports.js';
+import { humanTemperatureStatus } from './human-status.mjs';
 
 // Web Audio Context for browser buzzer alerts mirroring physical ESP32
 let audioCtx = null;
@@ -60,22 +66,40 @@ document.addEventListener('DOMContentLoaded', () => {
   initStore();
 
   // Serial Parser Setup: Direct line feed from USB stream
+  let serialManager;
   const parser = new ESP32Parser(
     (reading) => {
       recordReading(reading);
+      serialManager?.markReceiving?.();
     },
     (rawLine) => {
       appendTerminalLine(rawLine);
+    },
+    (line, error) => {
+      appendTerminalLine(`[INVALID JSON: ${error.message}] ${line}`, true);
+      updateStatusBadge('invalid-json');
+      renderDashboard(state);
+    },
+    (result) => {
+      applyProfileCommandResult(result);
     }
   );
 
   // Serial Manager Setup: Web Serial API on 115200 baud
-  const serialManager = new SerialManager(parser, {
+  serialManager = new SerialManager(parser, {
     onConnect: (info) => {
+      state.connection.connectedAt = new Date();
+      state.connection.portName = 'USB Serial (selected in browser)';
+      state.connection.baudRate = info.baudRate || 115200;
+      state.connection.isSimulated = !!info.isSimulated;
       updateConnectionUI(true, info);
     },
-    onDisconnect: () => {
+    onDisconnect: (reason) => {
+      state.connection.connectedAt = null;
+      state.connection.portName = null;
+      clearConfirmedDeviceProfile('disconnected');
       updateConnectionUI(false);
+      if (reason === 'connection-lost') updateStatusBadge('connection-lost');
     },
     onError: (err) => {
       console.error('Serial Error:', err);
@@ -84,6 +108,7 @@ document.addEventListener('DOMContentLoaded', () => {
     },
     onStatusChange: (status) => {
       updateStatusBadge(status);
+      renderDashboard(state);
     },
   });
 
@@ -107,7 +132,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderTimeline(state.alertsHistory);
 
   // Live Clock
-  setInterval(updateLiveClock, 1000);
+  setInterval(() => { updateLiveClock(); expireStaleAssessment(); expireStaleTelemetry(); }, 1000);
   updateLiveClock();
 });
 
@@ -178,9 +203,51 @@ function initNavigation() {
 // --------------------------------------------------------------------------
 // Dashboard & Telemetry Rendering (REAL SENSOR VALUES ONLY)
 // --------------------------------------------------------------------------
+function hasCurrentTelemetry(currentState) {
+  return currentState.connection.status === 'receiving'
+    && currentState.connection.lastUpdate
+    && (!currentState.connection.connectedAt || currentState.connection.lastUpdate >= currentState.connection.connectedAt);
+}
+
+function humanCalculationSummary(current) {
+  const calculation = current.humanCalculation || {};
+  const unit = humanTemperatureUnit(calculation);
+  const measured = !current.dhtError && Number.isFinite(calculation.measuredTemperature) ? `${calculation.measuredTemperature.toFixed(1)} ${unit}` : 'unavailable';
+  const difference = !current.dhtError && Number.isFinite(calculation.temperatureDifference)
+    ? `${calculation.temperatureDifference > 0 ? '+' : ''}${calculation.temperatureDifference.toFixed(1)} ${unit}` : 'unavailable';
+  const crossed = !current.dhtError && typeof calculation.thresholdCrossed === 'boolean'
+    ? calculation.thresholdCrossed ? 'crossed' : 'not crossed' : 'unavailable';
+  const valid = typeof calculation.temperatureValid === 'boolean' ? calculation.temperatureValid : 'unavailable';
+  return `Active profile ${current.patientProfile} · Calculation profile ${calculation.profile || 'unavailable'} · Measured ${measured} · Active threshold ${Number.isFinite(current.patientTemperatureThreshold) ? `${current.patientTemperatureThreshold.toFixed(1)} °C` : 'unavailable'} · Calculation threshold ${Number.isFinite(calculation.temperatureThreshold) ? `${calculation.temperatureThreshold.toFixed(1)} °C` : 'unavailable'} · Difference ${difference} · Threshold ${crossed} · Temperature valid ${valid} · Unit ${unit}`;
+}
+
+function humanTemperatureUnit(calculation) {
+  const rawUnit = typeof calculation.temperatureUnit === 'string' ? calculation.temperatureUnit.trim().toUpperCase() : '';
+  return ['C', '°C', 'CELSIUS'].includes(rawUnit) || !rawUnit ? '°C' : calculation.temperatureUnit;
+}
+
+function updateProfileCommandStatus(commandStatus = state.connection.profileCommandStatus) {
+  const el = document.getElementById('profile-command-status');
+  if (el) el.textContent = commandStatus?.message || 'ESP32 profile has not been changed.';
+}
+
+function updateAvailableProfileLabels(current) {
+  const labels = { GENERAL: 'General population', OLDER_ADULT: 'Older adults (65+)', PREGNANT: 'Pregnant women', CHILD_UNDER_FIVE: 'Children under five', ASTHMA: 'People with asthma' };
+  document.querySelectorAll('#risk-profile-options [data-profile-name]').forEach(label => {
+    const name = label.dataset.profileName;
+    const reported = current.patientProfiles.find(profile => profile.name === name);
+    const threshold = Number.isFinite(reported?.temperatureThreshold) ? ` (${reported.temperatureThreshold.toFixed(1)} °C)` : '';
+    const isActive = typeof reported?.active === 'boolean' ? reported.active : current.patientProfile === name;
+    const active = isActive ? ' · ESP32 active' : '';
+    label.textContent = `${labels[name]}${threshold}${active}`;
+  });
+}
+
 function renderDashboard(currentState) {
   const c = currentState.current;
-  const isConnected = currentState.connection.status === 'connected';
+  const telemetryIsCurrent = hasCurrentTelemetry(currentState);
+  const isBuzzerActive = telemetryIsCurrent && c.buzzer.state === 'ACTIVE';
+  const isConnected = ['connected', 'receiving', 'invalid-json'].includes(currentState.connection.status);
   const isWaiting = currentState.connection.status === 'connected-waiting';
   const hasEverReceived = !!currentState.connection.lastUpdateString;
 
@@ -188,6 +255,25 @@ function renderDashboard(currentState) {
   const tempEl = document.getElementById('dash-val-temp');
   const tempBadge = document.getElementById('badge-temp-status');
   const tempTrend = document.getElementById('dash-trend-temp');
+  const heatIndexEl = document.getElementById('dash-heat-index');
+  const tempThresholdsEl = document.getElementById('dash-temp-thresholds');
+  const humidityThresholdsEl = document.getElementById('dash-hum-thresholds');
+  const sparklineThresholdEl = document.getElementById('sparkline-temp-threshold');
+  if (heatIndexEl) heatIndexEl.textContent = Number.isFinite(c.heatIndex) ? `Heat index (ESP32): ${c.heatIndex.toFixed(2)} °C` : 'Heat index (ESP32): --';
+  if (heatIndexEl) heatIndexEl.textContent += ` · ${formatThresholds(c.thresholds, ['heat_index_caution','heat_index_high','heat_index_extreme'], '°C')}`;
+  if (tempThresholdsEl) tempThresholdsEl.textContent = formatThresholds(c.thresholds, ['temperature_caution','temperature_high','temperature_extreme'], '°C');
+  if (humidityThresholdsEl) humidityThresholdsEl.textContent = formatThresholds(c.thresholds, ['humidity_low','humidity_high','humidity_extreme'], '%');
+  const patientThresholdEl = document.getElementById('dash-patient-threshold');
+  const buzzerThresholdEl = document.getElementById('dash-buzzer-threshold');
+  const sensorPatientThresholdEl = document.getElementById('sensor-patient-threshold');
+  const settingsPatientThresholdEl = document.getElementById('settings-patient-threshold');
+  updateAvailableProfileLabels(c);
+  updateProfileCommandStatus();
+  if (patientThresholdEl) patientThresholdEl.textContent = Number.isFinite(c.patientTemperatureThreshold) ? `${c.patientTemperatureThreshold.toFixed(1)} °C` : '--';
+  if (buzzerThresholdEl) buzzerThresholdEl.textContent = Number.isFinite(c.patientTemperatureThreshold) ? `${c.patientTemperatureThreshold.toFixed(1)} °C` : '--';
+  if (sensorPatientThresholdEl) sensorPatientThresholdEl.textContent = Number.isFinite(c.patientTemperatureThreshold) ? `${c.patientTemperatureThreshold.toFixed(1)} °C` : 'unavailable';
+  if (settingsPatientThresholdEl) settingsPatientThresholdEl.textContent = Number.isFinite(c.patientTemperatureThreshold) ? `${c.patientTemperatureThreshold.toFixed(1)} °C (${c.patientProfile})` : 'Waiting for ESP32 profile';
+  if (sparklineThresholdEl) sparklineThresholdEl.textContent = Number.isFinite(c.thresholds.temperature_high) ? `HIGH: ${c.thresholds.temperature_high} °C` : 'DEVICE THRESHOLD: --';
 
   if (c.dhtError) {
     if (tempEl) tempEl.textContent = 'ERROR';
@@ -198,15 +284,18 @@ function renderDashboard(currentState) {
     if (tempTrend) tempTrend.textContent = 'Sensor Fault (GPIO 4)';
   } else if (typeof c.temperature === 'number') {
     if (tempEl) tempEl.textContent = c.temperature.toFixed(2);
-    const isBuzzerActive = c.buzzer.state === 'ACTIVE';
     if (tempBadge) {
-      tempBadge.textContent = isBuzzerActive ? 'HIGH (BUZZER ACTIVE)' : 'Nominal';
+      tempBadge.textContent = c.protocol === 'json'
+        ? (c.riskLevel === 'UNKNOWN' ? 'RISK UNKNOWN' : `${c.riskLevel}${isBuzzerActive ? ' (BUZZER ACTIVE)' : ''}`)
+        : isBuzzerActive ? 'HIGH (BUZZER ACTIVE)' : 'Nominal';
       tempBadge.className = isBuzzerActive
         ? 'px-space-xs py-0.5 bg-primary text-surface font-label-sm text-label-sm tracking-wider uppercase rounded font-semibold'
         : 'px-space-xs py-0.5 border border-primary text-primary font-label-sm text-label-sm tracking-wider uppercase rounded font-semibold bg-brand-rock/10';
     }
     if (tempTrend) {
-      tempTrend.textContent = isBuzzerActive ? 'Exceeds 34.0°C Setpoint' : 'Nominal Range';
+      tempTrend.textContent = c.protocol === 'json'
+        ? c.dhtError ? 'Human calculation unavailable' : `Threshold ${c.humanCalculation?.thresholdCrossed === true ? 'crossed' : c.humanCalculation?.thresholdCrossed === false ? 'not crossed' : 'status unavailable'} · Difference ${Number.isFinite(c.humanCalculation?.temperatureDifference) ? `${c.humanCalculation.temperatureDifference > 0 ? '+' : ''}${c.humanCalculation.temperatureDifference.toFixed(1)} ${humanTemperatureUnit(c.humanCalculation || {})}` : 'unavailable'}`
+        : isBuzzerActive ? 'Exceeds 34.0°C Setpoint' : 'Nominal Range';
     }
   } else {
     if (tempEl) tempEl.textContent = '--';
@@ -215,6 +304,17 @@ function renderDashboard(currentState) {
       tempBadge.className = 'px-space-xs py-0.5 border border-primary text-primary font-label-sm text-label-sm tracking-wider uppercase rounded font-semibold bg-brand-rock/10';
     }
     if (tempTrend) tempTrend.textContent = 'Awaiting Telemetry';
+  }
+
+  if (tempTrend && c.protocol === 'json') {
+    const status = humanTemperatureStatus(c, telemetryIsCurrent);
+    const profile = telemetryIsCurrent ? c.patientProfile || 'unavailable' : 'unavailable';
+    const calculation = c.humanCalculation || {};
+    const temperature = telemetryIsCurrent && calculation.temperatureValid === true && Number.isFinite(calculation.measuredTemperature)
+      ? `${calculation.measuredTemperature.toFixed(1)}°C` : 'unavailable';
+    const threshold = telemetryIsCurrent && Number.isFinite(c.patientTemperatureThreshold)
+      ? `${c.patientTemperatureThreshold.toFixed(1)}°C` : 'unavailable';
+    tempTrend.textContent = `HUMAN LEVEL: ${status} | PROFILE: ${profile} | TEMPERATURE: ${temperature} | THRESHOLD: ${threshold}`;
   }
 
   // 2. Humidity Card (DHT22)
@@ -255,7 +355,7 @@ function renderDashboard(currentState) {
   } else {
     if (gasEl) gasEl.textContent = '--';
     if (gasBadge) {
-      gasBadge.textContent = isWaiting ? 'WAITING FOR DATA' : (hasEverReceived && !isConnected ? 'LAST RECEIVED VALUE' : 'RAW ADC STREAM');
+      gasBadge.textContent = isWaiting ? 'WAITING FOR DATA' : (hasEverReceived && !isConnected ? 'LAST RECEIVED VALUE' : 'SENSOR UNAVAILABLE');
     }
   }
 
@@ -276,7 +376,7 @@ function renderDashboard(currentState) {
     if (lngEl) lngEl.textContent = c.gps.longitude.toFixed(6);
     if (radarText) radarText.textContent = `Ephemeris Locked (${c.gps.satellites || 0} Satellites)`;
   } else if (c.gps.hasFix === false) {
-    if (gpsFixEl) gpsFixEl.textContent = 'NO FIX';
+    if (gpsFixEl) gpsFixEl.textContent = 'WAITING FOR GPS FIX';
     if (gpsBadge) {
       gpsBadge.textContent = 'NO FIX';
       gpsBadge.className = 'px-space-xs py-0.5 border border-primary text-primary font-label-sm text-label-sm tracking-wider uppercase rounded font-semibold bg-brand-rock/20';
@@ -324,10 +424,15 @@ function renderDashboard(currentState) {
   const buzzerPing = document.getElementById('dash-buzzer-ping');
   const buzzerDesc = document.getElementById('dash-buzzer-desc');
 
-  const isBuzzerActive = c.buzzer.state === 'ACTIVE';
-  const isBuzzerOff = c.buzzer.state === 'OFF';
+  const isBuzzerOff = telemetryIsCurrent && c.buzzer.state === 'OFF';
+  const buzzerIsStale = !telemetryIsCurrent && c.buzzer.state !== 'WAITING';
 
-  if (isBuzzerActive) {
+  if (buzzerIsStale) {
+    if (buzzerStatus) buzzerStatus.textContent = `STALE - LAST ${c.buzzer.state === 'ACTIVE' ? 'ON' : 'OFF'}`;
+    if (buzzerWrap) buzzerWrap.className = 'flex items-center gap-1.5 px-space-xs py-0.5 border border-brand-rock text-secondary rounded';
+    if (buzzerPing) buzzerPing.className = 'w-2 h-2 rounded-full bg-secondary/50';
+    if (buzzerDesc) buzzerDesc.textContent = 'Last reported ESP32 state; current buzzer state is unknown.';
+  } else if (isBuzzerActive) {
     if (buzzerStatus) buzzerStatus.textContent = 'BUZZER ACTIVE';
     if (buzzerWrap) {
       buzzerWrap.className = 'flex items-center gap-1.5 px-space-xs py-0.5 bg-primary text-surface rounded';
@@ -394,15 +499,32 @@ function renderDashboard(currentState) {
 
   // Ambient Status Pill
   const ambEl = document.getElementById('stat-ambient-status');
+  const riskDetails = document.getElementById('dash-firmware-details');
+  const hasFirmwareMessage = !!currentState.connection.lastUpdate && c.protocol === 'json';
+  const firmwareMessageCurrent = hasCurrentTelemetry(currentState);
+  const firmwareRisk = hasFirmwareMessage && firmwareMessageCurrent && c.riskLevel !== 'UNKNOWN';
   if (ambEl) {
-    if (isBuzzerActive) {
+    if (hasFirmwareMessage && !firmwareMessageCurrent) {
+      ambEl.textContent = `LAST ${c.riskLevel}`;
+    } else if (firmwareRisk) {
+      ambEl.textContent = c.riskLevel;
+    } else if (hasFirmwareMessage) {
+      ambEl.textContent = 'RISK UNKNOWN';
+    } else if (isBuzzerActive) {
       ambEl.textContent = 'HIGH TEMPERATURE';
+    } else if (currentState.heatAssessment && currentState.heatAssessment.dataQuality !== 'valid') {
+      ambEl.textContent = 'HEAT ASSESSMENT UNAVAILABLE';
+    } else if (currentState.heatAssessment && currentState.heatAssessment.riskLevel !== 'normal') {
+      ambEl.textContent = `HEAT ${currentState.heatAssessment.riskLevel.toUpperCase()}`;
     } else if (currentState.connection.lastUpdateString) {
       ambEl.textContent = 'Nominal';
     } else {
       ambEl.textContent = 'Waiting for data...';
     }
   }
+  if (riskDetails) riskDetails.textContent = hasFirmwareMessage
+    ? `${c.riskReason || 'ESP32 risk unavailable'} | ${humanCalculationSummary(c)}${firmwareMessageCurrent ? '' : ` | LAST MESSAGE (${currentState.connection.status})`}`
+    : currentState.connection.status === 'stale' ? 'Last ESP32 message is stale' : 'Waiting for ESP32 risk and profile data';
 
   // Disconnected / Last Received label banner
   const subheadEl = document.getElementById('dash-subtitle');
@@ -432,11 +554,35 @@ function updateAlertBanner(currentState) {
   // The alert panel is visible ONLY when an active alert exists
   if (currentState.activeAlert) {
     alertBanner.classList.remove('hidden');
+    const heat = currentState.activeAlert.hazard === 'heat';
+    const firmwareRisk = currentState.activeAlert.hazard === 'firmware-risk';
+    const title = alertBanner.querySelector('.font-headline-sm');
+    const description = alertBanner.querySelector('p');
+    const badge = alertBanner.querySelector('.font-label-sm.text-label-sm.tracking-widest');
+    const metrics = alertBanner.querySelectorAll('.font-label-sm.text-label-sm.uppercase.text-secondary');
+    const buzzer = document.getElementById('alert-capsule-buzzer');
+    const signal = alertBanner.querySelector('.ml-auto');
+    const thresholdValue = alertBanner.querySelectorAll('.font-body-lg')[1];
+    if (title) title.textContent = firmwareRisk ? `ESP32 RISK: ${currentState.activeAlert.severity}` : heat ? `ATTENTION: Heat Risk — ${currentState.activeAlert.severity}` : 'ATTENTION: High Temperature Detected';
+    if (badge) badge.textContent = firmwareRisk ? 'FIRMWARE ASSESSMENT' : heat ? 'ENVIRONMENTAL RISK' : 'HARDWARE PRIORITY 1';
+    if (metrics[1]) metrics[1].textContent = firmwareRisk ? 'Patient Threshold' : heat ? 'Heat Index' : 'Threshold';
+    if (thresholdValue) thresholdValue.textContent = firmwareRisk ? (Number.isFinite(currentState.activeAlert.patientTemperatureThreshold) ? `${currentState.activeAlert.patientTemperatureThreshold} °C` : '--') : heat ? `≥ ${currentState.activeAlert.thresholdC?.toFixed(1) || '26.7'} °C` : '34.0 °C';
+    const currentDeviceReport = hasCurrentTelemetry(currentState);
+    const reportedBuzzer = currentState.activeAlert.buzzerOn === true ? 'ON' : currentState.activeAlert.buzzerOn === false ? 'OFF' : 'UNKNOWN';
+    if (buzzer) buzzer.textContent = firmwareRisk
+      ? currentDeviceReport ? reportedBuzzer : `LAST ${reportedBuzzer}`
+      : heat ? 'N/A' : currentDeviceReport ? 'ACTIVE' : 'LAST ON';
+    if (signal) signal.textContent = firmwareRisk ? `ESP32 reported: ${currentState.activeAlert.riskReason || 'No reason provided'}` : heat ? `Rule: ${currentState.activeAlert.ruleId} (calculated; not a medical diagnosis)` : 'Signal: Hardware Pin GPIO25 triggered (Firmware Controlled)';
+    if (description) description.textContent = firmwareRisk
+      ? `${currentState.activeAlert.resolutionPending ? 'Current risk cannot be confirmed from this message or data may be stale. ' : ''}${currentState.activeAlert.patientProfile || 'UNKNOWN'} · ${Number.isFinite(currentState.activeAlert.heatIndexC) ? 'Heat index ' + currentState.activeAlert.heatIndexC.toFixed(2) + ' °C' : 'Heat index unavailable'}. Risk assessment supplied by ESP32 firmware.`
+      : heat ? `${currentState.activeAlert.resolutionPending ? 'Current heat risk cannot be confirmed because sensor data is unavailable. ' : ''}Calculated heat index: ${Number.isFinite(currentState.activeAlert.heatIndexC) ? currentState.activeAlert.heatIndexC.toFixed(1) + ' °C' : '--'}. ${currentState.activeAlert.recommendedActions?.join(' ') || ''} ${currentState.activeAlert.relevantGroups?.length ? 'Additional guidance for: ' + currentState.activeAlert.relevantGroups.join(', ').replaceAll('_', ' ') + '.' : ''}`
+        : 'ESP32 firmware reported active buzzer on GPIO25 (High Temperature threshold exceeded).';
 
     const tempEl = document.getElementById('alert-capsule-temp');
     if (tempEl) {
-      tempEl.textContent = typeof currentState.current.temperature === 'number'
-        ? `${currentState.current.temperature.toFixed(2)} °C`
+      const temp = currentState.activeAlert.temperature ?? currentState.current.temperature;
+      tempEl.textContent = typeof temp === 'number'
+        ? `${temp.toFixed(2)} °C`
         : '--.-- °C';
     }
     const timeEl = document.getElementById('alert-capsule-time');
@@ -456,7 +602,6 @@ function updateAlertBanner(currentState) {
         ackBtn.className = 'bg-primary hover:bg-brand-rock text-surface hover:text-primary px-space-md py-space-xs rounded font-label-md text-label-md tracking-wider uppercase transition-all flex items-center gap-space-xs font-semibold';
       }
       if (ackText) ackText.textContent = 'Acknowledge Alert';
-      playAlertTone();
     }
   } else {
     alertBanner.classList.add('hidden');
@@ -483,7 +628,7 @@ function renderSparklines() {
   TelemetryCharts.renderSparkline(tempSvg, tempVals, {
     min: 20.0,
     max: 40.0,
-    threshold: 34.0,
+    threshold: state.current.thresholds.temperature_high ?? state.current.patientTemperatureThreshold ?? undefined,
   });
 
   TelemetryCharts.renderSparkline(humSvg, humVals, {
@@ -526,8 +671,8 @@ function renderTimeline(alerts) {
           </div>
         </td>
         <td class="py-space-sm px-space-sm">
-          <span class="px-space-xs py-0.5 ${isBuzzerActive ? 'bg-primary text-surface font-bold' : 'border border-brand-rock text-secondary'} font-label-sm text-label-sm rounded uppercase tracking-wider">
-            ${a.hardwareBuzzer}
+            <span class="px-space-xs py-0.5 ${isBuzzerActive ? 'bg-primary text-surface font-bold' : 'border border-brand-rock text-secondary'} font-label-sm text-label-sm rounded uppercase tracking-wider">
+            ${a.hardwareBuzzer || (a.hazard === 'heat' ? 'CALCULATED' : '—')}
           </span>
         </td>
         <td class="py-space-sm px-space-sm">
@@ -593,7 +738,7 @@ function initDashboardActions(serialManager) {
     btnAlertSilence.addEventListener('click', () => {
       isAudioMuted = !isAudioMuted;
       btnAlertSilence.textContent = isAudioMuted ? 'Unmute Browser Audio' : 'Mute Browser Audio';
-      alert('Browser alert audio state updated.\n\nNote: The physical ESP32 GPIO25 buzzer is hardware-controlled by the microcontroller firmware and will continue sounding until ambient temperature drops below 34.0°C.');
+      alert('Browser alert audio state updated. The physical ESP32 buzzer is firmware-controlled and cannot be silenced from this page.');
     });
   }
 
@@ -663,7 +808,7 @@ function renderHistoryView() {
   if (countEl) countEl.textContent = `${filtered.length} Stored Records`;
 
   const meta = {
-    temperature: { label: 'DHT22 Temperature', unit: '°C', setpoint: 34.0 },
+    temperature: { label: 'DHT22 Temperature', unit: '°C', setpoint: state.current.thresholds.temperature_high ?? state.current.patientTemperatureThreshold ?? null },
     humidity: { label: 'DHT22 Relative Humidity', unit: '%', setpoint: null },
     gasAnalog: { label: 'MQ-135 Analog ADC', unit: 'ADC', setpoint: null },
   };
@@ -798,13 +943,13 @@ function renderAlertsTable() {
   tbody.innerHTML = alerts.map(a => `
     <tr class="hover:bg-brand-rock/10 transition-colors font-body-sm text-body-sm">
       <td class="py-space-sm px-space-sm font-mono font-semibold">${a.displayTime}</td>
-      <td class="py-space-sm px-space-sm font-semibold">${a.event}</td>
+      <td class="py-space-sm px-space-sm font-semibold">${a.event}${a.status === 'resolved' ? ' (RESOLVED)' : ''}${a.severity ? ' — ' + a.severity : ''}${a.relevantGroups?.length ? `<div class="font-label-sm text-label-sm text-secondary mt-1">Precautions: ${a.relevantGroups.join(', ').replaceAll('_', ' ')}</div>` : ''}${a.recommendedActions?.length ? `<div class="font-label-sm text-label-sm text-secondary mt-1">${a.recommendedActions.join(' ')}</div>` : ''}</td>
       <td class="py-space-sm px-space-sm">
         <span class="px-2 py-0.5 rounded font-label-sm text-label-sm uppercase font-bold ${a.hardwareBuzzer === 'ACTIVE' ? 'bg-primary text-surface' : 'border border-brand-rock text-secondary'}">
-          ${a.hardwareBuzzer}
+          ${a.hardwareBuzzer || (a.hazard === 'heat' ? 'CALCULATED' : '—')}
         </span>
       </td>
-      <td class="py-space-sm px-space-sm font-mono">${a.temperature ? a.temperature.toFixed(2) + ' °C' : '34.0+ °C'}</td>
+      <td class="py-space-sm px-space-sm font-mono">${typeof a.temperature === 'number' ? a.temperature.toFixed(2) + ' °C' : '—'}${typeof a.heatIndexC === 'number' ? ' / HI ' + a.heatIndexC.toFixed(1) + ' °C' : ''}</td>
       <td class="py-space-sm px-space-sm">
         <span class="font-semibold font-label-sm text-label-sm uppercase ${a.acknowledged ? 'text-secondary' : 'text-primary border border-primary px-1.5 py-0.5 rounded'}">
           ${a.acknowledged ? 'Acknowledged (' + (a.audit || 'Staff') + ')' : 'Pending Review'}
@@ -836,6 +981,29 @@ function renderAlertsTable() {
 // Settings View & Developer Simulation
 // --------------------------------------------------------------------------
 function initSettingsView(serialManager) {
+  const profiles = [['general','GENERAL','General population'], ['older_adults','OLDER_ADULT','Older adults (65+)'], ['pregnant','PREGNANT','Pregnant women'], ['under_five','CHILD_UNDER_FIVE','Children under five'], ['asthma','ASTHMA','People with asthma']];
+  const profileBox = document.getElementById('risk-profile-options');
+  if (profileBox) {
+    profileBox.innerHTML = profiles.map(([id, deviceProfile, label]) => `<label class="flex items-center gap-2 cursor-pointer font-body-sm text-body-sm text-primary"><input type="checkbox" value="${id}" ${state.settings.profiles.includes(id) ? 'checked' : ''}/><span data-profile-name="${deviceProfile}">${label}</span></label>`).join('');
+    profileBox.querySelectorAll('input').forEach(input => input.addEventListener('change', async () => {
+      state.settings.profiles = [...profileBox.querySelectorAll('input:checked')].map(el => el.value);
+      saveState();
+      if (!input.checked) return;
+      const deviceProfile = profiles.find(([id]) => id === input.value)?.[1];
+      if (!deviceProfile) return;
+      state.connection.profileCommandStatus = { status: 'sending', message: `Requesting ${deviceProfile} from ESP32...` };
+      updateProfileCommandStatus();
+      try {
+        await serialManager.setProfile(deviceProfile);
+        if (state.connection.profileCommandStatus.status === 'sending') {
+          state.connection.profileCommandStatus = { status: 'awaiting', message: `Command sent for ${deviceProfile}; waiting for ESP32 confirmation.` };
+        }
+      } catch (error) {
+        state.connection.profileCommandStatus = { status: 'failed', message: `ESP32 profile was not changed: ${error.message}` };
+      }
+      updateProfileCommandStatus();
+    }));
+  }
   document.getElementById('btn-settings-connect')?.addEventListener('click', async () => {
     try {
       await serialManager.connect(115200);
@@ -863,7 +1031,6 @@ function initSettingsView(serialManager) {
         if (simLabel) simLabel.textContent = 'Simulator: Active (DEVELOPER MODE)';
         if (simBanner) simBanner.classList.remove('hidden');
       } else {
-        serialManager.stopSimulation();
         serialManager.disconnect();
         if (simLabel) simLabel.textContent = 'Simulator: Inactive';
         if (simBanner) simBanner.classList.add('hidden');
@@ -981,12 +1148,12 @@ function openSensorModal(sensorKey) {
     if (valMax) valMax.textContent = stats.max !== '--' ? `${stats.max} °C` : '--';
     metricKey = 'temperature';
     unit = '°C';
-    setpoint = 34.0;
+    setpoint = current.protocol === "json" ? current.patientTemperatureThreshold : 34.0;
     if (specText) {
       specText.innerHTML = `
         <p><strong>Hardware Pin:</strong> ESP32 GPIO 4</p>
         <p><strong>Protocol:</strong> Single-wire digital bitstream (DHT.h)</p>
-        <p><strong>Hardware Threshold:</strong> 34.0 °C (ESP32 Firmware Buzzer Trigger)</p>
+        <p><strong>Active Profile Temperature Threshold (ESP32 report):</strong> ${Number.isFinite(current.patientTemperatureThreshold) ? current.patientTemperatureThreshold + " °C" : "unavailable"}</p>
       `;
     }
   } else if (sensorKey === 'humidity') {
@@ -1046,11 +1213,11 @@ function openSensorModal(sensorKey) {
     if (valMax) valMax.textContent = state.activeAlert ? 'ACTIVE' : 'IDLE';
     metricKey = 'temperature';
     unit = '°C';
-    setpoint = 34.0;
+    setpoint = current.protocol === "json" ? current.patientTemperatureThreshold : 34.0;
     if (specText) {
       specText.innerHTML = `
         <p><strong>Hardware Pin:</strong> ESP32 BUZZER_PIN = 25 (Active HIGH)</p>
-        <p><strong>Firmware Logic:</strong> if (!isnan(temperature) && temperature > 34) digitalWrite(BUZZER_PIN, HIGH);</p>
+        <p><strong>Firmware Logic:</strong> Physical activation is controlled by device firmware; the dashboard reads the reported buzzer state.</p>
         <p><strong>Source of Truth:</strong> ESP32 Serial "BUZZER: ON - HIGH TEMPERATURE" / "BUZZER: OFF"</p>
       `;
     }
@@ -1130,6 +1297,7 @@ function updateStatusBadge(status) {
   const monState = document.getElementById('dash-monitoring-state');
   const monStatus = document.getElementById('dash-monitoring-status-text');
   const monDot = document.getElementById('dash-monitoring-dot');
+  const dashConn = document.getElementById('dash-conn-status');
 
   state.connection.status = status;
 
@@ -1159,6 +1327,36 @@ function updateStatusBadge(status) {
     if (monState) monState.textContent = 'Monitoring Active';
     if (monStatus) monStatus.textContent = 'Real Telemetry Stream';
     if (monDot) monDot.className = 'w-2 h-2 rounded-full bg-primary';
+  } else if (status === 'receiving') {
+    if (badge) badge.textContent = 'ESP32 RECEIVING DATA';
+    if (pill) pill.textContent = 'RECEIVING DATA';
+    if (pillWrap) pillWrap.className = 'flex items-center gap-space-xs px-space-sm py-1 bg-primary text-surface rounded';
+    if (subhead) subhead.textContent = `Receiving JSON over USB Serial at ${state.connection.baudRate} baud`;
+    if (monState) monState.textContent = 'Receiving Data';
+    if (monStatus) monStatus.textContent = 'Live JSON Telemetry';
+    if (dashConn) dashConn.textContent = `USB Serial · ${state.connection.baudRate} baud`;
+    if (monDot) monDot.className = 'w-2 h-2 rounded-full bg-primary animate-pulse';
+  } else if (status === 'invalid-json') {
+    if (badge) badge.textContent = 'INVALID JSON RECEIVED';
+    if (pill) pill.textContent = 'INVALID JSON';
+    if (subhead) subhead.textContent = 'Invalid JSON received; waiting for a valid ESP32 message.';
+    if (monState) monState.textContent = 'Invalid Message';
+    if (monStatus) monStatus.textContent = 'JSON Parse Error';
+    if (monDot) monDot.className = 'w-2 h-2 rounded-full bg-red-700';
+  } else if (status === 'stale') {
+    if (badge) badge.textContent = 'DATA STALE';
+    if (pill) pill.textContent = 'DATA STALE';
+    if (subhead) subhead.textContent = `No valid ESP32 message recently; last update ${state.connection.lastUpdateString || 'not received'}`;
+    if (monState) monState.textContent = 'Data Stale';
+    if (monStatus) monStatus.textContent = 'Connection Open, No Recent Data';
+    if (monDot) monDot.className = 'w-2 h-2 rounded-full bg-amber-600';
+  } else if (status === 'connection-lost') {
+    if (badge) badge.textContent = 'ESP32 CONNECTION LOST';
+    if (pill) pill.textContent = 'CONNECTION LOST';
+    if (subhead) subhead.textContent = `Serial connection lost; last valid message ${state.connection.lastUpdateString || 'not received'}`;
+    if (monState) monState.textContent = 'Connection Lost';
+    if (monStatus) monStatus.textContent = 'USB Serial Closed';
+    if (monDot) monDot.className = 'w-2 h-2 rounded-full bg-red-700';
   } else if (status === 'error') {
     if (badge) badge.textContent = 'ESP32 CONNECTION ERROR';
     if (ping) ping.className = 'inline-block w-1.5 h-1.5 rounded-full bg-red-700';
@@ -1193,11 +1391,24 @@ function updateLiveClock() {
   if (headerClock) headerClock.textContent = timeStr;
 }
 
+function formatThresholds(thresholds, keys, unit) {
+  const labels = keys[0]?.startsWith('humidity_') ? ['Low', 'High', 'Extreme'] : ['Caution', 'High', 'Extreme'];
+  const values = keys.map((key, index) => Number.isFinite(thresholds?.[key]) ? `${labels[index]} ${thresholds[key]}${unit}` : null).filter(Boolean);
+  return values.length ? values.join(' · ') : 'Waiting for device thresholds';
+}
+
 function handleStateUpdate(event, payload, currentState) {
+  if (event === 'alert_triggered') playAlertTone();
+  if (event === 'connection_stale') updateStatusBadge('stale');
   renderDashboard(currentState);
 
   if (event === 'reading_recorded') {
     renderSparklines();
+    renderAlertsTable();
+    renderTimeline(currentState.alertsHistory);
+  } else if (event === 'risk_expired') {
+    renderAlertsTable();
+    renderTimeline(currentState.alertsHistory);
   } else if (event === 'alert_triggered' || event === 'alert_acknowledged' || event === 'alert_cleared') {
     renderTimeline(currentState.alertsHistory);
   }
